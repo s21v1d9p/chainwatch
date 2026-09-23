@@ -35,6 +35,8 @@ try:
 except ImportError:
     pass
 
+from anomaly import AgentWalletBaseline, Transaction
+
 NETWORKS = {
     "devnet": "wss://api.devnet.solana.com",
     "mainnet": "wss://api.mainnet-beta.solana.com",
@@ -71,12 +73,13 @@ def send_telegram_alert(message: str):
 
 
 class ChainWatch:
-    def __init__(self, ws_url: str, address: str, program: str = None):
+    def __init__(self, ws_url: str, address: str, program: str = None, baseline_path: str = None):
         self.ws_url = ws_url
         self.address = address
         self.program = program
         self.last_lamports = None
         self.sub_ids = {}
+        self.baseline = AgentWalletBaseline(address, storage_path=baseline_path)
 
     async def run(self):
         print(f"[{now_iso()}] Connecting to {self.ws_url} ...")
@@ -125,6 +128,23 @@ class ChainWatch:
                     f"{old_sol:.9f} SOL to {sol:.9f} SOL (delta {delta:+.9f} SOL) at {now_iso()}"
                 )
                 send_telegram_alert(alert)
+
+                # Agent-behavior anomaly check: score the balance-changing
+                # event against this wallet's rolling baseline (size only —
+                # accountNotification has no program ID attached).
+                delta_lamports = abs(lamports - self.last_lamports)
+                tx = Transaction(
+                    signature=f"balance-change-{int(time.time())}",
+                    program_id=None,
+                    amount_lamports=delta_lamports,
+                )
+                anomalies = self.baseline.process(tx)
+                for a in anomalies:
+                    send_telegram_alert(
+                        f"[ANOMALY:{a['type']}] {self.address} — {a['detail']}"
+                    )
+                self.baseline.save()
+
                 self.last_lamports = lamports
 
         elif method == "logsNotification":
@@ -138,19 +158,40 @@ class ChainWatch:
             )
             send_telegram_alert(alert)
 
+            # Agent-behavior anomaly check: this is a NEW_PROGRAM / frequency
+            # candidate — we know the program ID here (the one we're
+            # subscribed to) even though we don't have the tx size from the
+            # logsNotification payload alone.
+            tx = Transaction(
+                signature=sig or f"logs-event-{int(time.time())}",
+                program_id=self.program,
+                amount_lamports=0,  # size unknown from logsNotification; size rule
+                                     # is scored separately via accountNotification
+            )
+            anomalies = self.baseline.process(tx)
+            for a in anomalies:
+                if a["type"] != "SIZE_OUTLIER":  # size is meaningless here (amount=0)
+                    send_telegram_alert(
+                        f"[ANOMALY:{a['type']}] {self.address} — {a['detail']}"
+                    )
+            self.baseline.save()
+
 
 def parse_args():
     p = argparse.ArgumentParser(description="ChainWatch — Solana security monitoring bot")
     p.add_argument("--address", required=True, help="Wallet/account pubkey to watch")
     p.add_argument("--program", default=None, help="Optional program ID to watch logs for")
     p.add_argument("--network", default="devnet", choices=["devnet", "mainnet"], help="Which cluster to use")
+    p.add_argument("--baseline-file", default=None,
+                    help="Path to persist the agent-behavior baseline JSON "
+                         "(default: baseline_<address>.json in cwd)")
     return p.parse_args()
 
 
 def main():
     args = parse_args()
     ws_url = os.getenv("SOLANA_WS_URL") or NETWORKS[args.network]
-    watcher = ChainWatch(ws_url, args.address, args.program)
+    watcher = ChainWatch(ws_url, args.address, args.program, baseline_path=args.baseline_file)
     try:
         asyncio.run(watcher.run())
     except KeyboardInterrupt:

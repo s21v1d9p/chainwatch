@@ -4,3 +4,5 @@ __pycache__/
 .env
 demo_wallet.json
 watcher.log
+baseline_*.json
+test_baseline_*.json
